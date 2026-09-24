@@ -130,7 +130,7 @@ function compact(a: Article, content?: 'text' | 'html'): CachedArticle & { conte
   const cats = a.categories ?? []
   const out: CachedArticle & { content?: string } = {
     id: a.id,
-    title: a.title,
+    title: htmlToText(a.title ?? ''),
     url: a.canonical?.[0]?.href ?? a.alternate?.[0]?.href,
     source: a.origin?.title,
     sourceId: a.origin?.streamId,
