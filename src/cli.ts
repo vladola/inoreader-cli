@@ -40,7 +40,7 @@ Local cache (the API allows ~100 read + ~100 write calls/day, so analyse offline
                                     fetch up to N×100 articles (default 3 pages) into the
                                     cache; stops early at already-cached items unless --deep
   cached [filters] [--group author|source|domain|tag] [--ids] [--full] [-n N]
-      filters: --feed S  --author S  --tag NAME  --untagged  --unread  --grep RE  --since ..
+      filters: --feed S  --author S  --url S  --tag NAME  --untagged  --unread  --grep RE  --since ..
                                     query the cache (no API calls). --ids prints bare ids,
                                     one per line, for piping into tag/read/etc.
 
@@ -106,6 +106,16 @@ function parseSince(s: string): number {
   return Math.floor(t / 1000)
 }
 
+const NAMED_ENTITIES: Record<string, string> = {
+  ldquo: '\u201c',
+  rdquo: '\u201d',
+  lsquo: '\u2018',
+  rsquo: '\u2019',
+  hellip: '\u2026',
+  mdash: '\u2014',
+  ndash: '\u2013',
+}
+
 function htmlToText(html: string): string {
   return html
     .replace(/<(script|style)[\s\S]*?<\/\1>/gi, '')
@@ -114,6 +124,7 @@ function htmlToText(html: string): string {
     .replace(/<li[^>]*>/gi, '- ')
     .replace(/<[^>]+>/g, '')
     .replace(/&nbsp;/g, ' ')
+    .replace(/&(ldquo|rdquo|lsquo|rsquo|hellip|mdash|ndash);/g, (_, n: string) => NAMED_ENTITIES[n])
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
@@ -400,6 +411,7 @@ function offline(cmd: string, o: Record<string, any>): unknown {
     (a) =>
       (!o.feed || has(a.sourceId, o.feed) || has(a.source, o.feed)) &&
       (!o.author || has(a.author, o.author)) &&
+      (!o.url || has(a.url, o.url)) &&
       (!o.tag || a.tags.includes(o.tag)) &&
       (!o.untagged || a.tags.length === 0) &&
       (!o.unread || !a.read) &&
@@ -467,6 +479,7 @@ async function main(): Promise<void> {
       deep: { type: 'boolean' },
       feed: { type: 'string' },
       author: { type: 'string' },
+      url: { type: 'string' },
       tag: { type: 'string' },
       untagged: { type: 'boolean' },
       group: { type: 'string' },
