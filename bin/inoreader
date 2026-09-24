@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Launcher: resolves the repo through symlinks and finds a Node >= 22.18
+# (native TypeScript), falling back to nvm so it works from non-login shells.
+set -euo pipefail
+
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+root="$(cd -P "$(dirname "$src")/.." && pwd)"
+
+node_ok() {
+  command -v node >/dev/null 2>&1 &&
+    node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>22||(a===22&&b>=18)?0:1)'
+}
+
+if ! node_ok; then
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  if [[ -s "$NVM_DIR/nvm.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$NVM_DIR/nvm.sh" --no-use
+    nvm use --silent "$(cat "$root/.nvmrc")" >/dev/null
+  fi
+fi
+node_ok || { echo "inoreader: need Node >= 22.18 on PATH (or via nvm)" >&2; exit 1; }
+
+exec node --disable-warning=ExperimentalWarning "$root/src/cli.ts" "$@"
