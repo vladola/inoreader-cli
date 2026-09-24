@@ -4,6 +4,7 @@
   "description": "Command-line client for the Inoreader API (JSON output), built on inoreader-js",
   "scripts": {
     "typecheck": "tsc",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts",
     "start": "node src/cli.ts"
   },
   "keywords": [

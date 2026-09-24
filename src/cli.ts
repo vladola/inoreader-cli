@@ -11,6 +11,8 @@ import {
 import { budgetLine, loadArticles, loadBudget, recordBudget, saveArticles, type CachedArticle } from './cache.ts'
 import { login } from './login.ts'
 import { load, remove, save, storeLocation, type StoredAuth } from './store.ts'
+import { WebError, WebSessionExpired } from './web.ts'
+import { WEB_USAGE, webCommand } from './webcli.ts'
 
 const USAGE = `inoreader — Inoreader API from the command line (JSON output)
 
@@ -51,6 +53,9 @@ Write (ID... may be "-" to read ids from stdin; batched 250 per call):
   edit-sub STREAM [--title T] [--folder NAME] [--remove-folder NAME]
   rename-tag OLD NEW  |  delete-tag NAME
 
+Web session (rules, filters, spotlights, settings the public API lacks; uses a
+browser cookie, not the API quota):  inoreader web --help
+
 Other:
   rate [--live]                     API budget as of the last call (--live: fresh, costs 1 read)
   raw GET|POST PATH [key=value...]  call any endpoint, e.g. raw GET /reader/api/0/user-info
@@ -61,7 +66,8 @@ ID: long form (tag:google.com,2005:reader/item/...) or as printed by \`list\`.
 
 Env: INOREADER_APP_ID/INOREADER_APP_KEY or INOREADER_OP_ITEM (login only),
      INOREADER_REDIRECT_URI (default http://localhost:8765/callback),
-     INOREADER_PROFILE, INOREADER_STORE=file, INOREADER_CREDENTIALS_FILE.
+     INOREADER_PROFILE, INOREADER_STORE=file, INOREADER_CREDENTIALS_FILE,
+     INOREADER_WEB_DELAY_MS (min gap between web-session calls, default 750).
 `
 
 const STATE = 'user/-/state/com.google/'
@@ -466,12 +472,31 @@ async function main(): Promise<void> {
       group: { type: 'string' },
       ids: { type: 'boolean' },
       live: { type: 'boolean' },
+      // web session
+      'dry-run': { type: 'boolean' },
+      yes: { type: 'boolean', short: 'y' },
+      file: { type: 'string', short: 'f' },
+      'user-agent': { type: 'string' },
+      type: { type: 'string' },
+      kind: { type: 'string' },
+      feeds: { type: 'string' },
+      unfollow: { type: 'boolean' },
+      raw: { type: 'boolean' },
     },
   })
   const [cmd, ...args] = positionals
-  if (!cmd || o.help) {
+  if (!cmd || (o.help && cmd !== 'web')) {
     process.stdout.write(USAGE)
     return
+  }
+
+  // Web-session commands use a browser cookie, not OAuth (see web.ts).
+  if (cmd === 'web') {
+    if (!args.length || o.help) {
+      process.stdout.write(WEB_USAGE)
+      return
+    }
+    return print(await webCommand(args, o))
   }
 
   if (cmd === 'auth') {
@@ -516,6 +541,10 @@ async function main(): Promise<void> {
 
 main().catch((e: unknown) => {
   const out: Record<string, unknown> = { error: (e as Error).message }
+  if (e instanceof WebSessionExpired) {
+    out.type = 'WebSessionExpired'
+    out.hint = e.hint
+  } else if (e instanceof WebError) out.type = 'WebError'
   if (e instanceof InoreaderError) {
     out.type = e.constructor.name
     if (e.status) out.status = e.status
