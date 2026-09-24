@@ -8,7 +8,8 @@ so it works well for scripts and AI agents.
 - On macOS, credentials go in the **Keychain**. Elsewhere they go in a `0600` file.
 - A **local article cache** plus **API-budget tracking**. The API allows about 100 read
   and 100 write calls per day, so you sync once and then analyse offline.
-- A **web-session mode** for rules, filters, spotlights and a few settings the API lacks.
+- A **web-session mode** for rules, filters, spotlights, full-text search, full article content
+  and a few settings the API lacks. It is also used as an automatic fallback when the API budget runs out.
 - Batch writes: a single call can tag, star or mark read up to 250 articles.
 
 ## Requirements
@@ -72,8 +73,74 @@ inoreader rate                                 # budget as of the last call (fre
 After each API call, the remaining budget is printed to stderr. `sync` stops as soon as a
 page has no new articles, unless you pass `--deep`.
 
-Some things can't be done through the public API: rules, filters, spotlights and
-active searches. For those, see [Web session](#web-session-rules-filters-spotlights).
+Some things can't be done through the public API: rules, filters, spotlights, active
+searches and full-text search. For those, see [Web session](#web-session-rules-filters-spotlights).
+
+### Full-text search
+
+The public API has no search. `search` uses Inoreader's own full-text search through the
+web session (see below). It searches every article Inoreader stores for your subscriptions,
+not just the local cache, and reaches back years.
+
+```bash
+inoreader search "coding agent" -n 10
+inoreader search "rate limits" --stream folder:Tech --since 30d --in title
+inoreader search '"exact phrase"' --match phrase --order relevance --full-content
+```
+
+Options:
+
+- `--stream all|starred|tag:NAME|folder:NAME|feed:URL`
+- `--match all|any|phrase|advanced`
+- `--in all|title|content`
+- `--order newest|oldest|relevance`
+- `--language CODE`
+- plus `--since`, `--unread`, `--full` and `--full-content`
+
+Results have the same JSON shape as `list`. Like a search in the web app, each query is added
+to your Inoreader search history.
+
+### Full article content
+
+Many feeds only carry an excerpt. `get` and `list` accept `--full-content`. When the stored
+body looks truncated (short, or ending in "…" or "Read more"), the CLI tries two things:
+
+1. Inoreader's own **full content** extraction (the web app's "Full content" button, used
+   through the web session).
+2. Otherwise, it fetches the article's **original page** (plain HTTPS, a 15 s timeout) and
+   extracts the main text.
+
+Each item is marked `"contentSource"`:
+
+- `inoreader`: the stored body looked complete
+- `inoreader-full`: from Inoreader's full-content extraction
+- `original`: from the original page
+- `summary`: still only the excerpt; a `contentNote` explains why
+
+Newsletters (`@ino.to` feeds) already contain the whole email, so they're never fetched. Using
+Inoreader's full content leaves the article's "Full content" toggle as it was.
+
+### API budget fallback (`--via`)
+
+`list`, `sync`, `get`, `read`, `unread`, `star`, `unstar`, `tag` and `untag` can run over the
+API or the web session:
+
+- `--via api` always uses the API.
+- `--via web` always uses the web session. It needs `web login` and uses no API calls.
+- `--via auto` (default, or `INOREADER_VIA`) uses the API. It switches to the web session
+  when the recorded budget for that zone (read or write) is used up, or when the API answers
+  `RateLimitError`. It prints `{"fallback":"web","reason":…}` on stderr when it does.
+
+The web path is slower: it is throttled, pages hold about 40 articles, and `tag`/`untag` read
+each article's tags before writing them. Prefer the local cache when you can.
+
+Over the web, ids can also be an `inoreader.com/article/<hash>` link or its 16-hex hash.
+`--continuation` and the `saved`, `liked`, `annotated` and `read` streams are API-only.
+
+**Old articles stay read.** Inoreader "sinks" articles older than the folder's keep-unread
+window (at most 30 days). `unread` on them reports success but changes nothing, whichever
+transport you use. Use `star` (Read later) or a tag instead.
+
 
 ## Web session (rules, filters, spotlights)
 
@@ -130,6 +197,8 @@ inoreader web spotlight disable 11 12
 inoreader web sub active 456 off        # pause a feed
 inoreader web email-prefs               # "Emails from Inoreader" checkboxes
 inoreader web email-pref set top_stories_reminder off
+inoreader web keep-unread               # per-folder "keep unread" window, 1-30 days
+inoreader web keep-unread "Some folder" 30
 inoreader web --help                    # everything else
 ```
 
@@ -189,9 +258,13 @@ Deletes need `--yes`.
 | `INOREADER_STORE=file` | Store credentials in a file even on macOS |
 | `INOREADER_CREDENTIALS_FILE` | File path for the credential store |
 | `INOREADER_WEB_DELAY_MS` | Minimum gap between web-session calls (default 750) |
+| `INOREADER_VIA` | Default transport for article commands: `api`, `web` or `auto` (default) |
+| `INOREADER_FULL_MIN_CHARS` | Bodies shorter than this count as truncated for `--full-content` (default 1500) |
+| `INOREADER_FETCH_TIMEOUT_MS` | Timeout for fetching original pages (default 15000) |
 | `INOREADER_CACHE_TEXT_CHARS` | Characters of article text kept in the cache (default 4000) |
 
-The cache lives in `~/.cache/inoreader-cli/<profile>/`.
+The cache lives in `~/.cache/inoreader-cli/<profile>/`. It also holds `web-ids.json`, the
+learned key that maps web article hashes to API ids.
 
 ## License
 

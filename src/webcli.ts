@@ -43,6 +43,7 @@ import {
   type Lookups,
   type RuleSpec,
 } from './webrules.ts'
+import { KEEP_UNREAD_MAX, folderKeepUnread, setFolderKeepUnread } from './webreader.ts'
 
 export const WEB_USAGE = `Web session (unofficial web-app API: rules, filters, spotlights, settings):
   web login [--user-agent UA]       read a Cookie header or a DevTools "Copy as cURL"
@@ -76,6 +77,9 @@ export const WEB_USAGE = `Web session (unofficial web-app API: rules, filters, s
   web folder create NAME --feeds SUB_ID,...  |  web tag create NAME      (experimental)
   web folder delete ID --yes [--unfollow]    |  web tag delete ID --yes  (experimental)
   web monitor create [--file F]  |  web monitor edit SUB_ID [--file F]    (experimental)
+  web keep-unread [FOLDER] [DAYS]   per-folder "keep unread" window (1-${KEEP_UNREAD_MAX} days): show all,
+                                    show one (id or name), or set. Articles older than the
+                                    window (at most 30 days) are read for good ("sunk").
   web email-prefs                   "Emails from Inoreader" checkboxes (experimental read)
   web email-pref set KEY on|off     KEY: ${'newsletter|stars_email_reminder|top_stories_reminder|onboarding_emails|idle_user_email_reminder'}
   web raw FN [JSON_ARG...]          call any xajax function (args parsed as JSON, else string)
@@ -665,6 +669,27 @@ export async function webCommand(args: string[], o: Opts): Promise<unknown> {
       if (!k) throw new Error('--kind must be tag, folder or system')
       await s.write('change_folder_visibility', [numId(id), on, k[0], null, null], k[1])
       return s.dryRun ? planned(s) : { ok: true, id, kind: o.kind, outputFeed: on }
+    }
+
+    case 'keep-unread': {
+      const folders = (await loadSources(s)).folders
+      const find = (x: string) => folders.find((f) => f.id === x) ?? folders.find((f) => f.title === x) ?? folders.find((f) => f.title.toLowerCase() === x.toLowerCase())
+      if (!sub) {
+        const out = []
+        for (const f of folders) out.push({ id: f.id, folder: f.title, days: (await folderKeepUnread(s, f.id)) ?? null })
+        return out
+      }
+      const folder = find(sub)
+      if (!folder) throw new Error(`no folder "${sub}" (see: inoreader web keep-unread)`)
+      const current = (await folderKeepUnread(s, folder.id)) ?? null
+      if (rest[0] === undefined) return { id: folder.id, folder: folder.title, days: current }
+      const days = Number(rest[0])
+      if (!Number.isInteger(days) || days < 1 || days > KEEP_UNREAD_MAX) {
+        throw new Error(`DAYS must be 1-${KEEP_UNREAD_MAX} (the server clamps anything else; articles older than 30 days are always read)`)
+      }
+      const message = await setFolderKeepUnread(s, folder.id, days)
+      if (s.dryRun) return planned(s)
+      return { ok: true, id: folder.id, folder: folder.title, previous: current, days, message }
     }
 
     case 'email-prefs': {

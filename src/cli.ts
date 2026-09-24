@@ -11,7 +11,11 @@ import {
 import { budgetLine, loadArticles, loadBudget, recordBudget, saveArticles, type CachedArticle } from './cache.ts'
 import { login } from './login.ts'
 import { load, remove, save, storeLocation, type StoredAuth } from './store.ts'
-import { WebError, WebSessionExpired } from './web.ts'
+import { aidFromApiId } from './articles.ts'
+import { htmlToText } from './text.ts'
+import { WebError, WebSession, WebSessionExpired } from './web.ts'
+import { READ_COMMANDS, WEB_ARTICLE_COMMANDS, webArticles } from './webfallback.ts'
+import { fullContent } from './webreader.ts'
 import { WEB_USAGE, webCommand } from './webcli.ts'
 
 const USAGE = `inoreader — Inoreader API from the command line (JSON output)
@@ -32,8 +36,19 @@ Read:
       --oldest                      oldest first
       --continuation TOKEN          resume from a previous page
       --full                        include article text (--html for raw HTML)
+      --full-content                like --full, but expand truncated feed excerpts (see below)
       --grep REGEX                  filter fetched items by title/source
-  get ID...                         full article content (--html for raw HTML)
+  get ID... [--full-content]        full article content (--html for raw HTML)
+  search "TERM" [options]           Inoreader full-text search (web session; not in the API)
+      -n, --limit N                 max results (default 20)
+      --stream all|starred|tag:NAME|folder:NAME|feed:URL
+      --since 2d|ISO-date  --unread  --full  --full-content
+      --match all|any|phrase|advanced   --in all|title|content
+      --order newest|oldest|relevance   --language CODE
+
+--full-content: when the stored body looks truncated (short, or ends in "…"/"Read more"),
+  fetch Inoreader's own full content (web session), else the original page. Each item gets
+  "contentSource": inoreader | inoreader-full | original | summary. Newsletters are skipped.
 
 Local cache (the API allows ~100 read + ~100 write calls/day, so analyse offline):
   sync [STREAM] [--pages N] [--deep] [--unread] [--since ..] [--continuation T]
@@ -56,18 +71,25 @@ Write (ID... may be "-" to read ids from stdin; batched 250 per call):
 Web session (rules, filters, spotlights, settings the public API lacks; uses a
 browser cookie, not the API quota):  inoreader web --help
 
+--via api|web|auto (default auto, or INOREADER_VIA): transport for list, sync, get, read,
+  unread, star, unstar, tag, untag. auto uses the API and switches to the web session when
+  the recorded budget is used up or the API answers RateLimitError (noted on stderr).
+
 Other:
   rate [--live]                     API budget as of the last call (--live: fresh, costs 1 read)
   raw GET|POST PATH [key=value...]  call any endpoint, e.g. raw GET /reader/api/0/user-info
 
 STREAM: all | starred | saved | liked | annotated | read | tag:NAME | folder:NAME
         | feed:URL | a feed URL | any raw stream id (e.g. user/-/label/Tech)
-ID: long form (tag:google.com,2005:reader/item/...) or as printed by \`list\`.
+ID: long form (tag:google.com,2005:reader/item/...) or as printed by \`list\`; with the web
+    session also an inoreader.com/article/<hash> link or its 16-hex hash.
 
 Env: INOREADER_APP_ID/INOREADER_APP_KEY or INOREADER_OP_ITEM (login only),
      INOREADER_REDIRECT_URI (default http://localhost:8765/callback),
      INOREADER_PROFILE, INOREADER_STORE=file, INOREADER_CREDENTIALS_FILE,
-     INOREADER_WEB_DELAY_MS (min gap between web-session calls, default 750).
+     INOREADER_WEB_DELAY_MS (min gap between web-session calls, default 750),
+     INOREADER_VIA, INOREADER_FULL_MIN_CHARS (truncation threshold, default 1500),
+     INOREADER_FETCH_TIMEOUT_MS (original-page fetch timeout, default 15000).
 `
 
 const STATE = 'user/-/state/com.google/'
@@ -104,37 +126,6 @@ function parseSince(s: string): number {
   const t = Date.parse(s)
   if (Number.isNaN(t)) throw new Error(`bad date/duration: ${s}`)
   return Math.floor(t / 1000)
-}
-
-const NAMED_ENTITIES: Record<string, string> = {
-  ldquo: '\u201c',
-  rdquo: '\u201d',
-  lsquo: '\u2018',
-  rsquo: '\u2019',
-  hellip: '\u2026',
-  mdash: '\u2014',
-  ndash: '\u2013',
-}
-
-function htmlToText(html: string): string {
-  return html
-    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(p|div|li|h[1-6]|blockquote|tr)>/gi, '\n')
-    .replace(/<li[^>]*>/gi, '- ')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&(ldquo|rdquo|lsquo|rsquo|hellip|mdash|ndash);/g, (_, n: string) => NAMED_ENTITIES[n])
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
-    .replace(/&amp;/g, '&')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
 }
 
 function compact(a: Article, content?: 'text' | 'html'): CachedArticle & { content?: string } {
@@ -221,6 +212,22 @@ function request(client: InoreaderClient, method: 'GET' | 'POST', path: string, 
   )
 }
 
+// --full-content for API results: the stored body, Inoreader's full content (web session,
+// when logged in) or the original page — whichever is the first complete-looking one.
+async function withFullContent(items: Article[], html: boolean): Promise<unknown[]> {
+  const web = new WebSession()
+  const out = []
+  for (const a of items) {
+    const base = compact(a)
+    const fc = await fullContent(
+      { aid: aidFromApiId(a.id), url: base.url, html: a.summary?.content, sourceId: base.sourceId },
+      web,
+    )
+    out.push({ ...base, content: html && fc.html ? fc.html : fc.text, contentSource: fc.contentSource, ...(fc.note ? { contentNote: fc.note } : {}) })
+  }
+  return out
+}
+
 async function run(cmd: string, args: string[], o: Record<string, any>, client: InoreaderClient): Promise<unknown> {
   const tagEdit = async (ids: string[], p: { a?: string; r?: string }) => {
     ids = await expandIds(ids)
@@ -276,16 +283,18 @@ async function run(cmd: string, args: string[], o: Record<string, any>, client: 
       } while (continuation && items.length < limit)
       const re = o.grep ? new RegExp(o.grep, 'i') : undefined
       const content = o.html ? 'html' : o.full ? 'text' : undefined
+      const kept = items.filter((a) => !re || re.test(`${a.title} ${a.origin?.title}`))
       return {
-        items: items.filter((a) => !re || re.test(`${a.title} ${a.origin?.title}`)).map((a) => compact(a, content)),
+        items: o['full-content'] ? await withFullContent(kept, !!o.html) : kept.map((a) => compact(a, content)),
         continuation,
       }
     }
 
     case 'get': {
       need(args, 1, 'get ID...')
-      const res = await request(client, 'POST', '/reader/api/0/stream/items/contents', { i: args })
-      return (res?.items ?? []).map((a: Article) => compact(a, o.html ? 'html' : 'text'))
+      const res = await request(client, 'POST', '/reader/api/0/stream/items/contents', { i: await expandIds(args) })
+      const items: Article[] = res?.items ?? []
+      return o['full-content'] ? withFullContent(items, !!o.html) : items.map((a) => compact(a, o.html ? 'html' : 'text'))
     }
 
     case 'sync': {
@@ -399,6 +408,14 @@ async function run(cmd: string, args: string[], o: Record<string, any>, client: 
   }
 }
 
+// From the last recorded budget: is the API zone this command needs used up right now?
+function budgetExhausted(zone: 'read' | 'write'): string | undefined {
+  const b = loadBudget()
+  if (!b || Date.parse(b.resetAt) <= Date.now()) return undefined
+  const [used, limit] = zone === 'read' ? [b.zone1Usage, b.zone1Limit] : [b.zone2Usage, b.zone2Limit]
+  return used >= limit ? `API ${zone} budget used up (${used}/${limit}), resets ${b.resetAt}` : undefined
+}
+
 // Commands that only touch local state — no login, no API budget.
 function offline(cmd: string, o: Record<string, any>): unknown {
   if (cmd === 'rate') return loadBudget() ?? { error: 'no budget recorded yet — run any API command or `rate --live`' }
@@ -495,6 +512,14 @@ async function main(): Promise<void> {
       feeds: { type: 'string' },
       unfollow: { type: 'boolean' },
       raw: { type: 'boolean' },
+      // article transport / search / full content
+      via: { type: 'string' },
+      'full-content': { type: 'boolean' },
+      stream: { type: 'string' },
+      match: { type: 'string' },
+      in: { type: 'string' },
+      order: { type: 'string' },
+      language: { type: 'string' },
     },
   })
   const [cmd, ...args] = positionals
@@ -533,13 +558,36 @@ async function main(): Promise<void> {
 
   if (cmd === 'cached' || (cmd === 'rate' && !o.live)) return print(offline(cmd, o))
 
+  // Full-text search only exists in the web app.
+  if (cmd === 'search') return print(await webArticles('search', args, o, parseSince))
+
+  const via = String(o.via ?? process.env.INOREADER_VIA ?? 'auto')
+  if (!['api', 'web', 'auto'].includes(via)) throw new Error('--via must be api, web or auto')
+  const webCapable = WEB_ARTICLE_COMMANDS.has(cmd)
+  if (webCapable && via === 'web') return print(await webArticles(cmd, args, o, parseSince))
+  if (webCapable && via === 'auto') {
+    const reason = budgetExhausted(READ_COMMANDS.has(cmd) ? 'read' : 'write')
+    if (reason) {
+      process.stderr.write(`${JSON.stringify({ fallback: 'web', reason })}\n`)
+      return print(await webArticles(cmd, args, o, parseSince))
+    }
+  }
+
   const stored = load()
   if (!stored?.refreshToken) throw new Error('not logged in — run: inoreader auth login')
   const { clientId, clientSecret, redirectUri, ...tokens } = stored
   const client = new InoreaderClient({ clientId, clientSecret, redirectUri })
   client.setCredentials(tokens)
   try {
-    print(await run(cmd, args, o, client))
+    let result: unknown
+    try {
+      result = await run(cmd, args, o, client)
+    } catch (e) {
+      if (!(e instanceof RateLimitError) || !webCapable || via !== 'auto') throw e
+      process.stderr.write(`${JSON.stringify({ fallback: 'web', reason: `API rate limit: ${e.message}` })}\n`)
+      result = await webArticles(cmd, args, o, parseSince)
+    }
+    print(result)
   } finally {
     const budget = recordBudget(client.getRateLimitInfo())
     if (budget) process.stderr.write(`${budgetLine(budget)}\n`)
