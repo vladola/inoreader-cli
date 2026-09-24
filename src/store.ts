@@ -1,6 +1,7 @@
 // Credential storage: macOS Keychain (via `security`), or a 0600 JSON file elsewhere.
 // Everything (app id/key + OAuth tokens) lives in one blob so a normal run
 // never needs 1Password or env vars — only `auth login` does.
+// A second blob (account suffix "web") holds the web-session cookie; see web.ts.
 
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -20,49 +21,65 @@ export interface StoredAuth {
 const SERVICE = 'inoreader-cli'
 const ACCOUNT = process.env.INOREADER_PROFILE || 'default'
 const useKeychain = process.platform === 'darwin' && process.env.INOREADER_STORE !== 'file'
-const filePath =
+const baseFile =
   process.env.INOREADER_CREDENTIALS_FILE ||
   join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'inoreader-cli', `${ACCOUNT}.json`)
 
-export function storeLocation(): string {
-  return useKeychain ? `macOS Keychain (service=${SERVICE}, account=${ACCOUNT})` : filePath
+function account(suffix?: string): string {
+  return suffix ? `${ACCOUNT}:${suffix}` : ACCOUNT
 }
 
-export function load(): StoredAuth | undefined {
+function filePath(suffix?: string): string {
+  return suffix ? baseFile.replace(/(\.json)?$/, `.${suffix}.json`) : baseFile
+}
+
+export function storeLocation(suffix?: string): string {
+  return useKeychain ? `macOS Keychain (service=${SERVICE}, account=${account(suffix)})` : filePath(suffix)
+}
+
+export function loadBlob<T>(suffix?: string): T | undefined {
   let raw: string
   if (useKeychain) {
-    const r = spawnSync('security', ['find-generic-password', '-s', SERVICE, '-a', ACCOUNT, '-w'], { encoding: 'utf8' })
+    const r = spawnSync('security', ['find-generic-password', '-s', SERVICE, '-a', account(suffix), '-w'], {
+      encoding: 'utf8',
+    })
     if (r.status !== 0) return undefined
     raw = Buffer.from(r.stdout.trim(), 'base64').toString('utf8')
   } else {
     try {
-      raw = readFileSync(filePath, 'utf8')
+      raw = readFileSync(filePath(suffix), 'utf8')
     } catch {
       return undefined
     }
   }
-  return JSON.parse(raw) as StoredAuth
+  return JSON.parse(raw) as T
 }
 
-export function save(auth: StoredAuth): void {
-  const json = JSON.stringify(auth)
+export function saveBlob(data: unknown, suffix?: string): void {
+  const json = JSON.stringify(data)
   if (useKeychain) {
     // Feed the command through `security -i` on stdin so the secret never appears in argv / `ps`.
     // Base64 keeps the value free of quotes and spaces.
     const b64 = Buffer.from(json, 'utf8').toString('base64')
-    const cmd = `add-generic-password -U -s ${SERVICE} -a ${ACCOUNT} -l ${SERVICE} -w ${b64}\n`
+    const acct = account(suffix)
+    const cmd = `add-generic-password -U -s ${SERVICE} -a ${acct} -l ${SERVICE} -w ${b64}\n`
     const r = spawnSync('security', ['-i'], { input: cmd, encoding: 'utf8' })
     if (r.status !== 0 || /error/i.test(r.stderr)) throw new Error(`keychain write failed: ${r.stderr.trim()}`)
     return
   }
-  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 })
-  writeFileSync(filePath, json, { mode: 0o600 })
+  const file = filePath(suffix)
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+  writeFileSync(file, json, { mode: 0o600 })
 }
 
-export function remove(): void {
+export function removeBlob(suffix?: string): void {
   if (useKeychain) {
-    spawnSync('security', ['delete-generic-password', '-s', SERVICE, '-a', ACCOUNT], { stdio: 'ignore' })
+    spawnSync('security', ['delete-generic-password', '-s', SERVICE, '-a', account(suffix)], { stdio: 'ignore' })
     return
   }
-  rmSync(filePath, { force: true })
+  rmSync(filePath(suffix), { force: true })
 }
+
+export const load = (): StoredAuth | undefined => loadBlob<StoredAuth>()
+export const save = (auth: StoredAuth): void => saveBlob(auth)
+export const remove = (): void => removeBlob()
