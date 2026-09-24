@@ -412,9 +412,8 @@ async function spotlightCommand(s: WebSession, sub: string, args: string[], o: O
       const cur = await getSpotlight(s, args[0])
       const terms = spec.terms ? spec.terms.map(termOf).filter((t) => t.term) : cur.terms
       if (!terms.length) throw new Error('spotlight needs at least one term')
-      const post: Record<string, unknown> = { id: Number(args[0]) }
-      // The inline editor never posts a name; only send one when it actually changes.
-      if (spec.name && spec.name !== cur.name) post.name = spec.name
+      // Always send the name: the server blanks it when the field is missing (verified live).
+      const post: Record<string, unknown> = { id: Number(args[0]), name: spec.name || cur.name }
       Object.assign(post, {
         team: (spec.team ?? cur.team) ? 1 : 0,
         description: spec.description ?? cur.description,
